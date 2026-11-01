@@ -1,0 +1,27 @@
+# Python & uv
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Pipeline outputs, heavy 3DGS data, and local binaries
+runs/
+bin/
+target/
+*.ply
+*.insv
+*.osv
+*.mp4
+*.mov
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/

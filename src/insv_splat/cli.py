@@ -54,7 +54,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "fov": 84.0,
         "include_upper_views": True,
         "sparse_azimuth": False,
-        "max_features": 12288,
+        "max_features": 18432,
         "temporal_window": 8,
         "loop_topk": 28,
         "steps": 40000,
@@ -63,6 +63,25 @@ PRESETS: dict[str, dict[str, Any]] = {
         "growth_grad_threshold": 0.000025,
     },
 }
+
+
+def _parse_boost_windows(raw_windows: list[str] | None) -> list[tuple[float, float]]:
+    if not raw_windows:
+        return []
+    out: list[tuple[float, float]] = []
+    for item in raw_windows:
+        for tok in item.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            if ":" not in tok:
+                raise ValueError(f"Invalid --boost-window '{tok}'; expected START:END in seconds (e.g. 480:595)")
+            a_s, b_s = tok.split(":", 1)
+            lo, hi = float(a_s), float(b_s)
+            if hi <= lo:
+                raise ValueError(f"Invalid --boost-window '{tok}'; END must be greater than START")
+            out.append((lo, hi))
+    return out
 
 
 def _apply_preset_defaults(args: argparse.Namespace) -> None:
@@ -141,7 +160,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     export_dir = run_dir / "exports"
 
     _, gpu_info = detect_egpu_env(prefer_egpu=not args.no_egpu)
-    use_cuda_decode = bool(gpu_info.get("egpu_detected")) and not args.no_egpu
+    use_cuda_decode = bool(gpu_info.get("nvdec_ready", gpu_info.get("egpu_detected"))) and not args.no_egpu
 
     print(f"  Input INSV : {src.primary_path} ({src.size_bytes / (1024**3):.2f} GiB)", flush=True)
     print(f"  Camera     : {meta.camera_model} (rig={meta.rig_type}, streams={len(meta.streams)})", flush=True)
@@ -158,6 +177,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     print(f"  Output Dir : {run_dir}", flush=True)
 
     print("\n=== [2/5] Motion-gated & sharpness-ranked keyframe selection ===", flush=True)
+    boost_windows = _parse_boost_windows(args.boost_window)
     keyframes, kf_stats = select_keyframes(
         src.primary_path,
         duration_s=meta.streams[0].duration_s,
@@ -168,6 +188,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         use_cuda=use_cuda_decode,
         start_s=args.start_time,
         end_s=args.end_time,
+        boost_windows=boost_windows,
     )
     print(f"  Keyframes  : {kf_stats}", flush=True)
 
@@ -190,7 +211,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     )
     print(f"  Extracted  : {len(views)} views ({args.image_size}x{args.image_size}, FOV={args.fov} deg)", flush=True)
 
-    print("\n=== [4/5] Running SfM (SIFT + Analytical Spherical Rig + GLOMAP/COLMAP + BA) ===", flush=True)
+    print("\n=== [4/5] Running SfM (SIFT + Analytical Spherical Rig + GLOMAP/COLMAP + BA + Dense Seeding) ===", flush=True)
     focal_px = pinhole_focal_px(args.image_size, args.fov)
     sfm_stats = run_sfm(
         dataset_dir=dataset_dir,
@@ -203,6 +224,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         loop_topk=args.loop_topk,
         max_num_features=args.max_features,
         use_spherical_rig=not args.no_spherical_rig,
+        dense_surface_seeding=not args.no_dense_seeding,
     )
     print(f"  SfM Result : {sfm_stats}", flush=True)
 
@@ -298,6 +320,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--min-motion", type=float, default=3.5, help="Minimum grayscale L1 motion score to skip hovers")
     p_run.add_argument("--start-time", type=float, default=0.0, help="Start timestamp in seconds")
     p_run.add_argument("--end-time", type=float, default=None, help="End timestamp in seconds")
+    p_run.add_argument(
+        "--boost-window",
+        action="append",
+        default=None,
+        help="Timestamp interval START:END in seconds for dense ~0.5s roof/detail sampling (repeatable)",
+    )
     p_run.add_argument("--image-size", type=int, default=None, help="Square perspective cutout resolution")
     p_run.add_argument("--fov", type=float, default=None, help="Horizontal/vertical pinhole FOV in degrees")
     p_run.add_argument("--jpeg-quality", type=int, default=98, help="JPEG quality (98 + 4:4:4 chroma)")
@@ -305,6 +333,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--no-upper-views", action="store_true", help="Disable Stream 1 upper views even in balanced/ultra presets")
     p_run.add_argument("--sparse-azimuth", action="store_true", default=None, help="Use 4 obliques (90 deg) instead of 6 obliques (60 deg)")
     p_run.add_argument("--no-spherical-rig", action="store_true", help="Disable analytical spherical COLMAP RigConfig")
+    p_run.add_argument("--no-dense-seeding", action="store_true", help="Disable post-BA CUDA multi-view dense surface seeding")
     p_run.add_argument("--mapper", choices=["auto", "glomap", "colmap"], default="auto", help="SfM reconstruction backend")
     p_run.add_argument("--temporal-window", type=int, default=None, help="Sliding keyframe window for inter-frame matching")
     p_run.add_argument("--loop-topk", type=int, default=None, help="Visual retrieval top-K loop closure pairs per view")

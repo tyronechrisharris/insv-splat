@@ -43,10 +43,31 @@ def default_brush_binary() -> Path:
     )
 
 
+def _vulkan_icd_usable(icd_path: Path) -> bool:
+    """Verify that forcing `VK_ICD_FILENAMES=icd_path` actually enumerates a live Vulkan GPU."""
+    test_env = os.environ.copy()
+    test_env["VK_ICD_FILENAMES"] = str(icd_path)
+    test_env["VK_DRIVER_FILES"] = str(icd_path)
+    res = subprocess.run(
+        ["vulkaninfo", "--summary"],
+        env=test_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return res.returncode == 0 and "GPU0" in res.stdout and "llvmpipe" not in res.stdout.split("GPU0:")[-1][:300]
+
+
 def detect_egpu_env(prefer_egpu: bool = True) -> tuple[dict[str, str], dict]:
-    """Configure Vulkan/wgpu environment variables to bind directly to the NVIDIA eGPU when available."""
+    """Configure Vulkan/wgpu environment variables to bind the discrete NVIDIA eGPU (with safe Vulkan fallback)."""
     env = os.environ.copy()
-    gpu_info: dict = {"egpu_detected": False, "gpu_name": "default", "vram_mib": 0}
+    gpu_info: dict = {
+        "egpu_detected": False,
+        "nvdec_ready": False,
+        "vulkan_nvidia_ready": False,
+        "gpu_name": "default",
+        "vram_mib": 0,
+    }
 
     if prefer_egpu:
         smi = subprocess.run(
@@ -65,6 +86,8 @@ def detect_egpu_env(prefer_egpu: bool = True) -> tuple[dict[str, str], dict]:
             if len(parts) >= 4:
                 gpu_info = {
                     "egpu_detected": True,
+                    "nvdec_ready": True,
+                    "vulkan_nvidia_ready": False,
                     "gpu_name": parts[0],
                     "vram_mib": int(parts[1]),
                     "driver_version": parts[2],
@@ -72,12 +95,41 @@ def detect_egpu_env(prefer_egpu: bool = True) -> tuple[dict[str, str], dict]:
                 }
                 env["WGPU_BACKEND"] = "vulkan"
                 env["WGPU_POWER_PREF"] = "high"
-                env["WGPU_ADAPTER_NAME"] = parts[0]
                 icd = _find_nvidia_vulkan_icd()
-                if icd is not None:
-                    # Override confined ICD paths (e.g. snap shells) so Vulkan binds the discrete NVIDIA GPU
+                if icd is not None and _vulkan_icd_usable(icd):
+                    gpu_info["vulkan_nvidia_ready"] = True
+                    env["WGPU_ADAPTER_NAME"] = parts[0]
                     env["VK_ICD_FILENAMES"] = str(icd)
                     env["VK_DRIVER_FILES"] = str(icd)
+        else:
+            # NVML/userspace driver mismatch (e.g. pending reboot after driver upgrade):
+            # PyTorch CUDA forward-compat still runs on the NVIDIA eGPU while Brush uses active system Vulkan GPU.
+            env["WGPU_BACKEND"] = "vulkan"
+            env["WGPU_POWER_PREF"] = "high"
+            vk_name = "system_vulkan"
+            vk_res = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True, check=False)
+            if vk_res.returncode == 0:
+                m_vk = re.search(r"deviceName\s*=\s*(.+)", vk_res.stdout)
+                if m_vk:
+                    vk_name = m_vk.group(1).strip()
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    props = torch.cuda.get_device_properties(0)
+                    gpu_info = {
+                        "egpu_detected": True,
+                        "nvdec_ready": False,
+                        "vulkan_nvidia_ready": False,
+                        "gpu_name": f"{props.name} (CUDA) + {vk_name} (Vulkan)",
+                        "vram_mib": int(round(props.total_memory / (1024**2))),
+                        "driver_version": "cuda_forward_compat_pending_reboot",
+                        "pci_bus_id": f"{props.pci_bus_id:02x}:00.0" if hasattr(props, "pci_bus_id") else "cuda:0",
+                    }
+                else:
+                    gpu_info["gpu_name"] = vk_name
+            except Exception:
+                gpu_info["gpu_name"] = vk_name
 
     return env, gpu_info
 

@@ -57,6 +57,12 @@ def _decode_thumbnail(
     return np.frombuffer(res.stdout[:expected], dtype=np.uint8).reshape((thumb_size, thumb_size))
 
 
+def _in_any_window(ts: float, windows: list[tuple[float, float]] | None) -> bool:
+    if not windows:
+        return False
+    return any(lo <= ts <= hi for lo, hi in windows)
+
+
 def select_keyframes(
     insv_path: Path,
     duration_s: float,
@@ -69,15 +75,21 @@ def select_keyframes(
     use_cuda: bool = True,
     start_s: float = 0.0,
     end_s: float | None = None,
+    boost_windows: list[tuple[float, float]] | None = None,
 ) -> tuple[list[KeyframeCandidate], dict]:
     """Scan video at coarse/fine intervals, skip stationary/hovering & blurry frames, and pick top keyframes.
+
+    Args:
+        boost_windows: Optional list of `(start_s, end_s)` intervals (e.g. fast high-altitude roof passes)
+            where dense ~0.5s active motion frames are retained in addition to the base keyframe budget.
 
     Returns:
         (selected_keyframes, stats_dict)
     """
     t_end = min(duration_s - 0.5, end_s) if end_s is not None else max(0.5, duration_s - 0.5)
     t_start = max(0.0, start_s)
-    probe_times = np.arange(t_start, t_end, probe_interval_s, dtype=np.float64).tolist()
+    eff_probe = min(probe_interval_s, 0.5) if boost_windows else probe_interval_s
+    probe_times = np.arange(t_start, t_end, eff_probe, dtype=np.float64).tolist()
     if not probe_times:
         probe_times = [t_start]
 
@@ -125,7 +137,11 @@ def select_keyframes(
         cand = KeyframeCandidate(timestamp_s=ts, sharpness=sharp, motion_from_prev=motion)
         all_candidates.append(cand)
 
-        if motion >= min_motion_score and (ts - anchor_ts) >= min_time_gap_s:
+        boosted = _in_any_window(ts, boost_windows)
+        req_motion = min(min_motion_score, 2.0) if boosted else min_motion_score
+        req_gap = min(min_time_gap_s, 0.45) if boosted else min_time_gap_s
+
+        if motion >= req_motion and (ts - anchor_ts) >= req_gap:
             active_pool.append(cand)
             anchor_img = blur
             anchor_ts = ts
@@ -152,17 +168,28 @@ def select_keyframes(
         else:
             dropped_blur = 0
 
-    # Partition active_pool into `max_keyframes` uniform motion-arc buckets and pick sharpest in each
-    if len(active_pool) <= max_keyframes:
-        selected = active_pool
-    else:
-        selected = []
-        edges = np.linspace(0, len(active_pool), max_keyframes + 1, dtype=int)
-        for b in range(max_keyframes):
-            chunk = active_pool[edges[b] : edges[b + 1]]
+    def _bucket_select(pool: list[KeyframeCandidate], target_n: int) -> list[KeyframeCandidate]:
+        if len(pool) <= target_n or target_n <= 0:
+            return list(pool[: max(0, target_n)] if target_n == 0 else pool)
+        out: list[KeyframeCandidate] = []
+        edges = np.linspace(0, len(pool), target_n + 1, dtype=int)
+        for b in range(target_n):
+            chunk = pool[edges[b] : edges[b + 1]]
             if chunk:
-                best = max(chunk, key=lambda c: c.sharpness)
-                selected.append(best)
+                out.append(max(chunk, key=lambda c: c.sharpness))
+        return out
+
+    boost_selected_count = 0
+    if boost_windows:
+        boost_pool = [c for c in active_pool if _in_any_window(c.timestamp_s, boost_windows)]
+        base_pool = [c for c in active_pool if not _in_any_window(c.timestamp_s, boost_windows)]
+        max_boost = max(90, max_keyframes // 2)
+        picked_boost = _bucket_select(boost_pool, max_boost)
+        boost_selected_count = len(picked_boost)
+        picked_base = _bucket_select(base_pool, max_keyframes)
+        selected = picked_base + picked_boost
+    else:
+        selected = _bucket_select(active_pool, max_keyframes)
 
     selected.sort(key=lambda c: c.timestamp_s)
     stats = {
@@ -170,8 +197,10 @@ def select_keyframes(
         "active_motion_frames": len(active_pool),
         "skipped_stationary_frames": skipped_stationary,
         "dropped_local_blur_frames": dropped_blur,
+        "boost_windows": [list(w) for w in boost_windows] if boost_windows else [],
+        "boost_selected_keyframes": boost_selected_count,
         "selected_keyframes": len(selected),
-        "probe_interval_s": probe_interval_s,
+        "probe_interval_s": eff_probe,
         "min_motion_score": min_motion_score,
         "time_span_s": [round(selected[0].timestamp_s, 2), round(selected[-1].timestamp_s, 2)],
     }

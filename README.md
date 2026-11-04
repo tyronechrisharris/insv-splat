@@ -16,10 +16,10 @@ Most `.insv`-to-3DGS scripts wrap the closed-source **Insta360 MediaSDK** to sti
 
 1. **Zero Proprietary SDK Dependency (Native Lens Type `155` Support):**
    Public builds of the Insta360 MediaSDK reject newer `offset_v3` Lens Type `155` trailers (`offset is not support`). `insv-splat` parses the binary EOF trailer (`8db42d694ccc418790edff439fe026bf`) directly in Python and unprojects factory **Mei Unified Omnidirectional** intrinsics (`xi, fx, fy, cx, cy, k1, k2, k3, p1, p2`) from raw `3840×3840` HEVC fisheye streams.
-2. **Stitch-Free Zero-Baseline Analytical Spherical Rig:**
-   Dual-fisheye cameras separate Lens 0 and Lens 1 by ~`71 mm` across the chassis. Equirectangular stitching across that baseline introduces seam parallax and ghosting on nearby geometry, while double-resampling degrades sharpness. `insv-splat` unprojects a **7-camera `1600×1600` Lanczos4 (`4:4:4` JPEG98) virtual pinhole rig** directly from Lens 0's exact optical center (`cam_from_rig` pure `SO(3)` rotation, `[0, 0, 0]` baseline) plus **4 upright sky-gated Lens 1 upper views**, solves globally in **GLOMAP**, and prunes weak/outlier frames before Ceres bundle adjustment.
+2. **Stitch-Free Zero-Baseline Analytical Spherical Rig + Cloud-Drift Rejection:**
+   Dual-fisheye cameras separate Lens 0 and Lens 1 by ~`71 mm` across the chassis. Equirectangular stitching across that baseline introduces seam parallax and ghosting on nearby geometry, while double-resampling degrades sharpness. `insv-splat` unprojects a **7-camera `1600×1600` Lanczos4 (`4:4:4` JPEG98) virtual pinhole rig** directly from Lens 0's exact optical center (`cam_from_rig` pure `SO(3)` rotation, `[0, 0, 0]` baseline) plus **4 upright cloud-gated Lens 1 upper views**, solves globally in **GLOMAP**, enforces **physical dual-lens co-location + trajectory-jump pruning** before and after Ceres bundle adjustment, and runs a **2-pass PyTorch CUDA Z-buffered slanted-plane dense surface seeder** so low-contrast dark roofs and texture-sparse facades never starve during 3DGS initialization.
 3. **Drone-Aware Keyframing & Thin-Client 8M-Splat Streaming:**
-   - Hardware-accelerated CUDA NVDEC (`0.5s`) I-frame probing automatically skips stationary hover segments and rejects yaw-jerk motion blur using a local sliding-median Laplacian filter.
+   - Hardware-accelerated CUDA NVDEC (`0.5s`) I-frame probing automatically skips stationary hover segments, rejects yaw-jerk motion blur using a local sliding-median Laplacian filter, and supports `--boost-window START:END` for dense `0.5s` sampling across fast elevated roof passes.
    - `insv-splat serve` runs a custom **PyTorch CUDA + Triton (`sm_120` Blackwell-ready) StopThePop 8×8 tile rasterizer** on your workstation GPU/eGPU and streams interactive 3DGS frames over WebSockets to any browser on your LAN or Tailscale network—bypassing mobile/laptop WebGL memory limits.
 
 ---
@@ -29,27 +29,28 @@ Most `.insv`-to-3DGS scripts wrap the closed-source **Insta360 MediaSDK** to sti
 ```mermaid
 flowchart LR
     A["SD Card Discovery & Active Flight Trim"] --> B["INSV Binary Trailer Parser (Mei v3 Type-155)"]
-    B --> C["0.5s CUDA NVDEC Probes + Local-Window Blur Filter"]
-    C --> D["1600x1600 Lanczos4 4:4:4 Rig (7-Cam Spherical Rig + 4 Upright Upper Views)"]
-    D --> E["12,288-Feat SIFT + 256-D Loop Retrieval + Analytical Rig GLOMAP + Outlier Pruning"]
-    E --> F["Brush Vulkan 3DGS Trainer (Up to 8M+ Gaussians)"]
-    F --> G["CUDA/Triton StopThePop WebSocket LAN Viewer"]
+    B --> C["0.5s Probes + Blur Filter + Optional Boost Windows"]
+    C --> D["1600x1600 Lanczos4 4:4:4 Rig (7-Cam Spherical Rig + Cloud-Gated Upper Views)"]
+    D --> E["18,432-Feat SIFT + Analytical Rig GLOMAP + Co-Location & Jump Pruning"]
+    E --> F["2-Pass CUDA Z-Buffered Slanted-Plane Surface Seeding"]
+    F --> G["Brush Vulkan 3DGS Trainer (Up to 8M+ Gaussians)"]
+    G --> H["CUDA/Triton StopThePop WebSocket LAN Viewer"]
 ```
 
 ---
 
-## Benchmark: Baseline Crop Pipeline vs. `insv-splat --preset ultra`
+## Benchmark Progression (`Fast` → `Ultra v0.2` → `Ultra v0.3`)
 
-Measured on a dual-stream `3840×3840` @ `29.97 fps` **Antigravity A1** residential aerial/close-up capture (`~9m 10s` active flight) trained on an **NVIDIA GeForce RTX 5060 Ti (16 GB eGPU)**:
+Measured on dual-stream `3840×3840` @ `29.97 fps` **Antigravity A1** residential multi-tier flights trained on an **NVIDIA GeForce RTX 5060 Ti (16 GB eGPU)**:
 
-| Stage / Metric | Baseline (`--preset fast`, 5-View Unbound) | Ultra (`--preset ultra`, Spherical Rig + Upper Views) | Gain |
+| Stage / Metric | Baseline (`--preset fast`, 5-View Unbound) | Ultra v0.2 (Spherical Rig) | **Ultra v0.3 (+ Boost Windows, Cloud Gate & CUDA Dense Seeding)** |
 | :--- | :--- | :--- | :--- |
-| **Motion-Spaced Keyframes** | `96` (`2.0s` probe interval) | **`190`** (`0.5s` probe interval + local blur filter) | **`1.98×` temporal density** |
-| **Extracted Pinhole Views** | `480` @ `1024×1024` bilinear (`5` Stream 0 views/kf) | **`2,034` @ `1600×1600` Lanczos4 JPEG98 4:4:4** (`7` Stream 0 rig + `4` upright Stream 1 views) | **`10.35×` raw pixel data** |
-| **Verified Registered Views** | `313` non-empty (`40` zero-point GLOMAP outliers) | **`1,852` verified inliers** (`91.1%` registration; `132` weak views pruned) | **`5.92×` valid views**, zero sky streaks |
-| **Sparse 3D Tie Points** | `25,950` | **`168,452`** | **`6.49×` denser** sparse cloud |
-| **Angular Reprojection Error** | `0.581 px` @ `1024 px` (`0.050°`) | **`0.754 px` @ `1600 px` (`0.042°`)** | **`17%` tighter** angular accuracy |
-| **Trained 3DGS Model** | `20,000` steps → `3.45M` Gaussians (`775 MB`) | **`40,000` steps → `8.00M` Gaussians (`1.80 GB`)** (`15.8 / 16.3 GiB` VRAM, `25.39 dB` P90 eval PSNR) | **`2.32×` Gaussian capacity** |
+| **Motion-Spaced Keyframes** | `96` (`2.0s` probe interval) | `190` (`0.5s` probe interval) | **`307`** (`205` base + `102` boosted `0.5s` roof-orbit frames) |
+| **Extracted Pinhole Views** | `480` @ `1024×1024` bilinear | `2,034` @ `1600×1600` Lanczos4 | **`2,584` @ `1600×1600` Lanczos4 JPEG98 4:4:4** (~600 cloud-only `up*` views auto-rejected) |
+| **Verified Registered Views** | `313` non-empty | `1,852` inliers (`91.1%`) | **`2,258` co-located inliers** (`210` drifted upper views & `35` trajectory jumps pruned) |
+| **Initialized 3D Points** | `25,950` sparse | `168,452` sparse | **`332,950`** (`324,842` high-sensitivity SIFT + `8,108` 2-pass CUDA slanted-plane roof seeds) |
+| **Reprojection / Render Quality** | `0.581 px` @ `1024 px` | `0.754 px` @ `1600 px` (`21.7 dB` mean PSNR) | **`0.787 px` @ `1600 px` (`24.51 dB` full-flight / `25.37 dB` roof-pass PSNR)** |
+| **Trained 3DGS Model** | `20,000` steps → `3.45M` Gaussians (`775 MB`) | `40,000` steps → `8.00M` Gaussians (`1.80 GB`) | **`42,000` steps → `8.00M` Gaussians (`1.80 GB`)** |
 
 ---
 
@@ -88,10 +89,12 @@ Run the full 5-stage pipeline (`--preset ultra` is the default; use `--preset ba
 
 ```bash
 # Full Ultra-Quality 8M-Gaussian reconstruction (16 GB VRAM recommended)
+# Optional --boost-window START:END retains dense 0.5s sharp frames over fast roof/facade orbits
 uv run insv-splat run \
   --preset ultra \
   --input /path/to/VID_20261031_001.insv \
   --start-time 15.0 \
+  --boost-window 435:595 \
   --anonymize
 
 # Faster 20k-step preview run (~8 GB VRAM)

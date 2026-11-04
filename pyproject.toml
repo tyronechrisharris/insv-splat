@@ -1,6 +1,6 @@
 [project]
 name = "insv-splat"
-version = "0.2.0"
+version = "0.3.0"
 description = "Stitch-free Insta360 & Antigravity A1 (.insv) dual-fisheye video to 3D Gaussian Splatting pipeline with analytical spherical rig SfM and server-side CUDA/Triton LAN viewer"
 readme = "README.md"
 license = { text = "MIT" }

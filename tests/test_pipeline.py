@@ -7,16 +7,21 @@ from pathlib import Path
 import numpy as np
 import pycolmap
 
-from insv_splat.cli import PRESETS, _apply_preset_defaults, build_parser
+from insv_splat.cli import PRESETS, _apply_preset_defaults, _parse_boost_windows, build_parser
 from insv_splat.metadata import _parse_mei_offset_v3
 from insv_splat.projection import (
     ExtractedView,
     _build_remap_grid,
+    _has_sufficient_structure,
     compute_view_rotation_s0,
     get_rig_specs,
     pinhole_focal_px,
 )
-from insv_splat.sfm import _configure_spherical_rig, build_smart_pair_list
+from insv_splat.sfm import (
+    _clean_and_flatten_reconstruction,
+    _configure_spherical_rig,
+    build_smart_pair_list,
+)
 
 
 def test_parse_mei_offset_v3_type_155() -> None:
@@ -120,8 +125,97 @@ def test_spherical_rig_config_application(tmp_path: Path) -> None:
 
 def test_cli_preset_defaults_and_overrides() -> None:
     parser = build_parser()
-    args = parser.parse_args(["run", "--preset", "fast", "--steps", "12345"])
+    args = parser.parse_args(
+        ["run", "--preset", "fast", "--steps", "12345", "--boost-window", "480:595"]
+    )
     _apply_preset_defaults(args)
     assert args.max_keyframes == PRESETS["fast"]["max_keyframes"]
     assert args.image_size == PRESETS["fast"]["image_size"]
     assert args.steps == 12345
+    assert _parse_boost_windows(args.boost_window) == [(480.0, 595.0)]
+
+
+def test_sky_cloud_structure_filter() -> None:
+    # Soft sinusoidal cloud waves should be rejected; crisp architectural checkerboard should pass
+    yy, xx = np.meshgrid(np.linspace(0, 12, 256), np.linspace(0, 12, 256))
+    clouds = np.clip(185.0 + 30.0 * np.sin(xx) * np.cos(yy), 0, 255).astype(np.uint8)
+    cloud_bgr = np.stack([clouds, clouds, clouds], axis=-1)
+    assert not _has_sufficient_structure(cloud_bgr)
+
+    checker = (((np.arange(256)[:, None] // 8 + np.arange(256)[None, :] // 8) % 2) * 180 + 40).astype(
+        np.uint8
+    )
+    facade_bgr = np.stack([checker, checker, checker], axis=-1)
+    assert _has_sufficient_structure(facade_bgr)
+
+
+def test_trajectory_jump_and_secondary_drift_pruning() -> None:
+    rec = pycolmap.Reconstruction()
+    cam = pycolmap.Camera(
+        model="SIMPLE_PINHOLE", width=256, height=256, params=[140.0, 128.0, 128.0], camera_id=1
+    )
+    rec.add_camera_with_trivial_rig(cam)
+
+    pts_world = [
+        np.array([(p_i % 9 - 4) * 0.6, (p_i // 9 - 3) * 0.6, 12.0 + (p_i % 5) * 0.4], dtype=np.float64)
+        for p_i in range(55)
+    ]
+
+    def _proj_kps(pos_w: np.ndarray) -> list[np.ndarray]:
+        out = []
+        for pw in pts_world:
+            pc = pw - pos_w
+            out.append(np.array([140.0 * pc[0] / pc[2] + 128.0, 140.0 * pc[1] / pc[2] + 128.0]))
+        return out
+
+    # 8 primary keyframes moving smoothly at 0.5 units/step along X, EXCEPT kf0004 which teleports +6.0 in Y
+    next_iid = 1
+    kf_to_iid: dict[int, int] = {}
+    for kf in range(8):
+        true_pos = np.array([kf * 0.5, 0.0, 0.0], dtype=np.float64)
+        solved_pos = np.array([kf * 0.5, 6.0 if kf == 4 else 0.0, 0.0], dtype=np.float64)
+        tcw = pycolmap.Rigid3d(pycolmap.Rotation3d(np.eye(3)), -solved_pos)
+        im = pycolmap.Image(
+            name=f"nadir/kf{kf:04d}_t{kf*1000:07d}.jpg",
+            keypoints=_proj_kps(solved_pos if kf == 4 else true_pos),
+            camera_id=1,
+            image_id=next_iid,
+        )
+        rec.add_image_with_trivial_frame(im, tcw)
+        kf_to_iid[kf] = next_iid
+        next_iid += 1
+
+    # Co-located upper view at kf0002 (offset 0.02 units -> kept)
+    pos_good = np.array([1.02, 0.0, 0.0], dtype=np.float64)
+    im_up_good = pycolmap.Image(
+        name="up000/kf0002_t0002000.jpg", keypoints=_proj_kps(pos_good), camera_id=1, image_id=next_iid
+    )
+    rec.add_image_with_trivial_frame(
+        im_up_good, pycolmap.Rigid3d(pycolmap.Rotation3d(np.eye(3)), -pos_good)
+    )
+    iid_up_good = next_iid
+    next_iid += 1
+
+    # Drifted cloud-tracking upper view at kf0005 (offset 8.0 units -> pruned)
+    pos_bad = np.array([2.5, 8.0, 0.0], dtype=np.float64)
+    im_up_bad = pycolmap.Image(
+        name="up000/kf0005_t0005000.jpg", keypoints=_proj_kps(pos_bad), camera_id=1, image_id=next_iid
+    )
+    rec.add_image_with_trivial_frame(
+        im_up_bad, pycolmap.Rigid3d(pycolmap.Rotation3d(np.eye(3)), -pos_bad)
+    )
+    iid_up_bad = next_iid
+
+    for p_i, pw in enumerate(pts_world):
+        tr = pycolmap.Track()
+        for iid in list(kf_to_iid.values()) + [iid_up_good, iid_up_bad]:
+            tr.add_element(iid, p_i)
+        rec.add_point3D(pw, tr, np.array([120, 120, 120], dtype=np.uint8))
+
+    flat, stats = _clean_and_flatten_reconstruction(rec, use_rig_constraints=False)
+    surviving_names = {im.name for im in flat.images.values()}
+    assert "nadir/kf0004_t0004000.jpg" not in surviving_names
+    assert "up000/kf0005_t0005000.jpg" not in surviving_names
+    assert "up000/kf0002_t0002000.jpg" in surviving_names
+    assert stats["pruned_trajectory_jump_images"] == 1
+    assert stats["pruned_drifted_secondary_images"] == 1

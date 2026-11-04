@@ -171,15 +171,16 @@ def _compute_global_descriptor(bgr: np.ndarray) -> list[float]:
     return vec.tolist()
 
 
-def _has_sufficient_structure(bgr: np.ndarray, min_active_tile_ratio: float = 0.30) -> bool:
-    """Reject views dominated by featureless overcast/blue sky."""
+def _has_sufficient_structure(bgr: np.ndarray, min_active_tile_ratio: float = 0.34) -> bool:
+    """Reject secondary-lens views dominated by sky/drifting clouds with only a thin horizon strip."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     small = cv2.resize(gray, (256, 256), interpolation=cv2.INTER_AREA)
     lap = cv2.Laplacian(small, cv2.CV_32F)
-    # Partition into 8x8 tiles and check how many tiles have meaningful edge energy
+    # Partition into 8x8 tiles and require real crisp architectural/foliage edge energy (var > 110),
+    # filtering out soft mackerel clouds (var ~ 20-50) that otherwise cause unbound upper views to drift.
     patches = lap.reshape(8, 32, 8, 32)
     variances = patches.var(axis=(1, 3))
-    active = int(np.sum(variances > 16.0))
+    active = int(np.sum(variances > 110.0))
     return (active / 64.0) >= min_active_tile_ratio
 
 
